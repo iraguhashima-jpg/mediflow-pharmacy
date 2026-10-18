@@ -537,4 +537,4 @@ app.use((err, req, res, next) => { res.status(500).json({ error: err.message || 
 import { startReminderScheduler } from './reminders.js';
 startReminderScheduler();
 
-app.listen(4000, () => console.log(`MediFlow API listening on port 4000`));
+app.listen(process.env.PORT || 4000, () => console.log(`MediFlow API listening on port " + (process.env.PORT || 4000)`));
