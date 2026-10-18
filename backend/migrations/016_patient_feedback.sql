@@ -1,0 +1,4 @@
+ALTER TABLE prescription_items
+  ADD COLUMN IF NOT EXISTS patient_is_taking BOOLEAN DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS patient_side_effects TEXT DEFAULT NULL,
+  ADD COLUMN IF NOT EXISTS patient_feedback_at TIMESTAMPTZ;

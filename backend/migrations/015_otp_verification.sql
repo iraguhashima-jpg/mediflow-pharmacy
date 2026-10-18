@@ -1,0 +1,6 @@
+CREATE TABLE IF NOT EXISTS otp_codes (
+  phone TEXT PRIMARY KEY,
+  code TEXT NOT NULL,
+  expires_at TIMESTAMPTZ NOT NULL,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);

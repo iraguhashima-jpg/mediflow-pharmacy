@@ -1,0 +1,563 @@
+import 'dotenv/config';
+import express from 'express';
+import session from 'express-session';
+import connectPgSimple from 'connect-pg-simple';
+import helmet from 'helmet';
+import cors from 'cors';
+import { z } from 'zod';
+import { randomUUID } from 'node:crypto';
+
+import { pool, db } from './db.js';
+import { audit } from './audit.js';
+import {
+  PASSWORD_POLICY,
+  validatePassword,
+  hashPassword,
+  verifyPassword,
+  generateTempPassword,
+  recordLoginAttempt,
+  isLoginRateLimited,
+  requireAuth,
+  requireRole,
+  requirePasswordChanged,
+  ROLES
+} from './auth.js';
+
+// ---- Startup validation ----
+const REQUIRED = ['SESSION_SECRET', 'DATABASE_URL'];
+for (const key of REQUIRED) {
+  if (!process.env[key]) {
+    console.error(`FATAL: ${key} is not set. Aborting.`);
+    process.exit(1);
+  }
+}
+if (process.env.SESSION_SECRET.length < 32) {
+  console.error('FATAL: SESSION_SECRET must be at least 32 characters. Aborting.');
+  process.exit(1);
+}
+
+const PORT = Number(process.env.PORT || 4000);
+const FRONTEND_ORIGIN = process.env.FRONTEND_ORIGIN || 'http://127.0.0.1:5173';
+const IS_PROD = process.env.NODE_ENV === 'production';
+
+const app = express();
+app.set('trust proxy', 1);
+app.use(helmet({ crossOriginResourcePolicy: { policy: 'cross-origin' } }));
+app.use(express.json({ limit: '256kb' }));
+app.use(cors({ origin: FRONTEND_ORIGIN, credentials: true }));
+
+// ---- Session ----
+const PgStore = connectPgSimple(session);
+app.use(session({
+  store: new PgStore({ pool, tableName: 'session', createTableIfMissing: false }),
+  name: 'mediflow.sid',
+  secret: process.env.SESSION_SECRET,
+  resave: false,
+  saveUninitialized: false,
+  rolling: true,
+  cookie: {
+    httpOnly: true,
+    sameSite: 'lax',
+    secure: IS_PROD,
+    maxAge: 8 * 60 * 60 * 1000 // 8 hours
+  }
+}));
+
+// ---- Helpers ----
+const wrap = (fn) => (req, res, next) => Promise.resolve(fn(req, res, next)).catch(next);
+
+async function loadUserForSession(userId) {
+  const { rows } = await pool.query(
+    `SELECT id, name, email, role, status, must_change_password
+       FROM users WHERE id = $1`,
+    [userId]
+  );
+  return rows[0] || null;
+}
+
+// ---- Public: health + auth ----
+
+app.get('/api/health', wrap(async (_req, res) => {
+  const db = await pool.query('SELECT version() AS v');
+  res.json({
+    status: 'ok',
+    app: 'MediFlow Pharmacy API',
+    database: db.rows[0].v.split(' ').slice(0, 2).join(' '),
+    time: new Date().toISOString()
+  });
+}));
+
+app.post('/api/auth/login', wrap(async (req, res) => {
+  const input = z.object({
+    email: z.string().email().max(200),
+    password: z.string().min(1).max(200)
+  }).parse(req.body);
+
+  const email = input.email.toLowerCase();
+  const ip = req.ip;
+
+  if (await isLoginRateLimited(email, ip)) {
+    return res.status(429).json({
+      error: `Too many failed attempts. Try again in ${15} minutes.`
+    });
+  }
+
+  const { rows } = await pool.query(
+    `SELECT id, name, email, password_hash, role, status, must_change_password
+       FROM users WHERE email = $1`,
+    [email]
+  );
+  const user = rows[0];
+
+  const ok = user && user.status === 'ACTIVE'
+    && (await verifyPassword(input.password, user.password_hash));
+
+  await recordLoginAttempt(email, ip, !!ok);
+
+  if (!ok) {
+    // Don't leak which condition failed.
+    return res.status(401).json({ error: 'Email or password is incorrect.' });
+  }
+
+  await pool.query('UPDATE users SET last_login_at = now() WHERE id = $1', [user.id]);
+  await audit.run(user.id, 'LOGIN', 'user', user.id);
+
+  req.session.regenerate((err) => {
+    if (err) return res.status(500).json({ error: 'Could not create session.' });
+    req.session.user = {
+      id: user.id,
+      name: user.name,
+      email: user.email,
+      role: user.role,
+      mustChangePassword: !!user.must_change_password
+    };
+    res.json({
+      user: req.session.user,
+      passwordPolicy: PASSWORD_POLICY
+    });
+  });
+}));
+
+app.post('/api/auth/logout', requireAuth, (req, res) => {
+  const uid = req.session.user.id;
+  req.session.destroy(async () => {
+    res.clearCookie('mediflow.sid');
+    await audit.run(uid, 'LOGOUT', 'user', uid);
+    res.json({ ok: true });
+  });
+});
+
+app.get('/api/auth/me', wrap(async (req, res) => {
+  if (!req.session?.user) return res.json({ user: null });
+  // Refresh from DB so role/status changes take effect without re-login.
+  const fresh = await loadUserForSession(req.session.user.id);
+  if (!fresh || fresh.status !== 'ACTIVE') {
+    req.session.destroy(() => {});
+    return res.json({ user: null });
+  }
+  req.session.user = {
+    id: fresh.id,
+    name: fresh.name,
+    email: fresh.email,
+    role: fresh.role,
+    mustChangePassword: !!fresh.must_change_password
+  };
+  res.json({ user: req.session.user });
+}));
+
+app.post('/api/auth/change-password', requireAuth, wrap(async (req, res) => {
+  const input = z.object({
+    currentPassword: z.string().min(1).max(200),
+    newPassword: z.string().min(1).max(200)
+  }).parse(req.body);
+
+  const uid = req.session.user.id;
+  const { rows } = await pool.query(
+    'SELECT email, password_hash FROM users WHERE id = $1',
+    [uid]
+  );
+  const user = rows[0];
+  if (!user) return res.status(404).json({ error: 'User not found.' });
+
+  const ok = await verifyPassword(input.currentPassword, user.password_hash);
+  if (!ok) return res.status(401).json({ error: 'Current password is incorrect.' });
+
+  const policyError = validatePassword(input.newPassword, user.email);
+  if (policyError) return res.status(422).json({ error: policyError });
+
+  if (input.newPassword === input.currentPassword) {
+    return res.status(422).json({ error: 'New password must differ from current password.' });
+  }
+
+  const hash = await hashPassword(input.newPassword);
+  await pool.query(
+    `UPDATE users
+        SET password_hash = $1,
+            must_change_password = false
+      WHERE id = $2`,
+    [hash, uid]
+  );
+  await audit.run(uid, 'CHANGE_PASSWORD', 'user', uid);
+
+  req.session.user.mustChangePassword = false;
+  res.json({ ok: true });
+}));
+
+// ---- Routes below this line require a normal (non-temp-password) session ----
+const gate = [requireAuth, requirePasswordChanged];
+
+app.get('/api/dashboard', ...gate, wrap(async (_req, res) => {
+  const medicines = (await pool.query(`
+    SELECT m.*, COALESCE(SUM(b.quantity),0)::int AS stock
+    FROM medicines m LEFT JOIN batches b ON b.medicine_id = m.id
+    GROUP BY m.id ORDER BY m.name`)).rows;
+  const lowStock = medicines.filter((m) => m.stock <= m.reorder_level);
+  const near = (await pool.query(`
+    SELECT b.*, m.name AS medicine_name, m.sku FROM batches b
+    JOIN medicines m ON m.id = b.medicine_id
+    WHERE b.quantity > 0 AND b.expiry_date >= CURRENT_DATE
+      AND b.expiry_date <= CURRENT_DATE + INTERVAL '90 days'
+    ORDER BY b.expiry_date`)).rows;
+  const expired = (await pool.query(`
+    SELECT b.*, m.name AS medicine_name, m.sku FROM batches b
+    JOIN medicines m ON m.id = b.medicine_id
+    WHERE b.quantity > 0 AND b.expiry_date < CURRENT_DATE
+    ORDER BY b.expiry_date`)).rows;
+  const salesToday = (await pool.query(`
+    SELECT COALESCE(SUM(total),0)::float AS total, COUNT(*)::int AS count
+    FROM sales WHERE created_at::date = CURRENT_DATE`)).rows[0];
+  const recentSales = (await pool.query(`
+    SELECT s.*, m.name AS medicine_name FROM sales s
+    JOIN medicines m ON m.id = s.medicine_id
+    ORDER BY s.id DESC LIMIT 8`)).rows;
+  res.json({
+    metrics: {
+      medicineCount: medicines.length,
+      stockUnits: medicines.reduce((s, m) => s + m.stock, 0),
+      lowStock: lowStock.length,
+      outOfStock: medicines.filter((m) => m.stock === 0).length,
+      nearExpiry: near.length,
+      expiredValue: expired.reduce((s, b) => s + b.quantity * Number(b.cost_price), 0),
+      salesToday: Number(salesToday.total),
+      transactionsToday: Number(salesToday.count)
+    },
+    lowStock: lowStock.slice(0, 8),
+    nearExpiry: near.slice(0, 8),
+    expired: expired.slice(0, 8),
+    recentSales
+  });
+}));
+
+// ---- Medicines ----
+app.get('/api/medicines', ...gate, wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const { rows } = await pool.query(`
+    SELECT m.*, COALESCE(SUM(b.quantity),0)::int AS stock
+    FROM medicines m LEFT JOIN batches b ON b.medicine_id = m.id
+    WHERE m.name ILIKE $1 OR m.sku ILIKE $1
+    GROUP BY m.id ORDER BY m.name`, [`%${q}%`]);
+  res.json(rows);
+}));
+
+app.post('/api/medicines', requireAuth, requirePasswordChanged,
+  requireRole('OWNER', 'PHARMACIST'), wrap(async (req, res) => {
+  const m = z.object({
+    name: z.string().min(2).max(200),
+    sku: z.string().regex(/^[A-Za-z0-9_-]+$/).max(60),
+    category: z.string().min(1).max(100),
+    unit: z.string().min(1).max(30),
+    reorder_level: z.coerce.number().int().min(0).max(1_000_000)
+  }).parse(req.body);
+
+  const { rows } = await pool.query(`
+    INSERT INTO medicines (name, sku, category, unit, reorder_level)
+    VALUES ($1,$2,$3,$4,$5) RETURNING *`,
+    [m.name, m.sku, m.category, m.unit, m.reorder_level]);
+
+  await audit.run(req.session.user.id, 'CREATE', 'medicine', rows[0].id);
+  res.status(201).json(rows[0]);
+}));
+
+app.delete('/api/medicines/:id', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const { rows } = await pool.query(
+    'SELECT COUNT(*)::int AS n FROM sales WHERE medicine_id = $1', [id]);
+  if (rows[0].n > 0) {
+    return res.status(409).json({ error: 'Medicine has sales history and cannot be deleted.' });
+  }
+  await pool.query('DELETE FROM medicines WHERE id = $1', [id]);
+  await audit.run(req.session.user.id, 'DELETE', 'medicine', id);
+  res.json({ ok: true });
+}));
+
+// ---- Batches ----
+app.get('/api/batches', ...gate, wrap(async (req, res) => {
+  const q = String(req.query.q || '').trim();
+  const { rows } = await pool.query(`
+    SELECT b.*, m.name AS medicine_name, m.sku FROM batches b
+    JOIN medicines m ON m.id = b.medicine_id
+    WHERE m.name ILIKE $1 OR m.sku ILIKE $1 OR b.batch_number ILIKE $1
+    ORDER BY b.expiry_date`, [`%${q}%`]);
+  res.json(rows);
+}));
+
+app.post('/api/batches', requireAuth, requirePasswordChanged,
+  requireRole('OWNER', 'PHARMACIST'), wrap(async (req, res) => {
+  const b = z.object({
+    medicine_id: z.coerce.number().int().positive(),
+    batch_number: z.string().min(1).max(80),
+    quantity: z.coerce.number().int().min(0).max(10_000_000),
+    expiry_date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    cost_price: z.coerce.number().min(0).max(1e9),
+    selling_price: z.coerce.number().min(0).max(1e9)
+  }).parse(req.body);
+
+  const exists = (await pool.query(
+    'SELECT id FROM medicines WHERE id = $1', [b.medicine_id])).rows[0];
+  if (!exists) return res.status(404).json({ error: 'Medicine not found.' });
+
+  const { rows } = await pool.query(`
+    INSERT INTO batches (medicine_id, batch_number, quantity, expiry_date, cost_price, selling_price)
+    VALUES ($1,$2,$3,$4,$5,$6) RETURNING *`,
+    [b.medicine_id, b.batch_number, b.quantity, b.expiry_date, b.cost_price, b.selling_price]);
+
+  await audit.run(req.session.user.id, 'RECEIVE_STOCK', 'batch', rows[0].id);
+  res.status(201).json(rows[0]);
+}));
+
+// ---- Sales ----
+app.post('/api/sales', requireAuth, requirePasswordChanged,
+  requireRole('OWNER', 'PHARMACIST', 'STAFF'), wrap(async (req, res) => {
+  const input = z.object({
+    batch_id: z.coerce.number().int().positive(),
+    quantity: z.coerce.number().int().positive().max(100_000)
+  }).parse(req.body);
+
+  const result = await db.transaction(async (tx) => {
+    const batch = (await tx.query(`
+      SELECT b.*, m.name AS medicine_name FROM batches b
+      JOIN medicines m ON m.id = b.medicine_id
+      WHERE b.id = $1 FOR UPDATE`, [input.batch_id])).rows[0];
+    if (!batch) { const e = new Error('Batch not found.'); e.status = 404; throw e; }
+    const today = new Date().toISOString().slice(0, 10);
+    if (batch.expiry_date < today) {
+      const e = new Error('Expired stock cannot be sold.'); e.status = 409; throw e;
+    }
+    if (batch.quantity < input.quantity) {
+      const e = new Error('Not enough stock in this batch.'); e.status = 409; throw e;
+    }
+
+    await tx.query(
+      'UPDATE batches SET quantity = quantity - $1 WHERE id = $2',
+      [input.quantity, batch.id]);
+
+    const total = Number((Number(batch.selling_price) * input.quantity).toFixed(2));
+    const receipt = `MF-${Date.now()}-${randomUUID().slice(0, 6).toUpperCase()}`;
+
+    const sale = (await tx.query(`
+      INSERT INTO sales (receipt_number, medicine_id, batch_id, quantity, unit_price, total, sold_by)
+      VALUES ($1,$2,$3,$4,$5,$6,$7) RETURNING *`,
+      [receipt, batch.medicine_id, batch.id, input.quantity,
+       batch.selling_price, total, req.session.user.id])).rows[0];
+
+    await tx.query(
+      `INSERT INTO audit_logs (user_id, action, entity, entity_id)
+       VALUES ($1,'SALE','sale',$2)`,
+      [req.session.user.id, sale.id]);
+
+    return {
+      id: sale.id,
+      receipt_number: sale.receipt_number,
+      medicine_name: batch.medicine_name,
+      quantity: sale.quantity,
+      unit_price: Number(sale.unit_price),
+      total: Number(sale.total),
+      created_at: sale.created_at
+    };
+  });
+
+  res.status(201).json(result);
+}));
+
+app.get('/api/sales', ...gate, wrap(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT s.*, m.name AS medicine_name, u.name AS sold_by_name
+    FROM sales s JOIN medicines m ON m.id = s.medicine_id
+    LEFT JOIN users u ON u.id = s.sold_by
+    ORDER BY s.id DESC LIMIT 200`);
+  res.json(rows);
+}));
+
+// ---- Reports ----
+app.get('/api/reports/stock', requireAuth, requirePasswordChanged,
+  requireRole('OWNER', 'PHARMACIST'), wrap(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT m.id, m.name, m.sku, m.reorder_level,
+           COALESCE(SUM(b.quantity),0)::int AS stock,
+           COALESCE(SUM(b.quantity * b.cost_price),0)::float AS stock_value
+    FROM medicines m LEFT JOIN batches b ON b.medicine_id = m.id
+    GROUP BY m.id ORDER BY m.name`);
+  res.json(rows);
+}));
+
+app.get('/api/audit', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT a.*, u.name AS user_name FROM audit_logs a
+    LEFT JOIN users u ON u.id = a.user_id
+    ORDER BY a.id DESC LIMIT 200`);
+  res.json(rows);
+}));
+
+// ---- Users (OWNER only) ----
+app.get('/api/users', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (_req, res) => {
+  const { rows } = await pool.query(`
+    SELECT id, name, email, role, status, must_change_password,
+           created_at, last_login_at
+      FROM users ORDER BY id`);
+  res.json(rows);
+}));
+
+app.post('/api/users', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (req, res) => {
+  const input = z.object({
+    name: z.string().min(2).max(120),
+    email: z.string().email().max(200),
+    role: z.enum(ROLES)
+  }).parse(req.body);
+
+  const email = input.email.toLowerCase();
+  const exists = (await pool.query(
+    'SELECT id FROM users WHERE email = $1', [email])).rows[0];
+  if (exists) return res.status(409).json({ error: 'Email already in use.' });
+
+  const tempPassword = generateTempPassword();
+  const policyError = validatePassword(tempPassword, email);
+  if (policyError) return res.status(500).json({ error: 'Internal password policy failure.' });
+
+  const hash = await hashPassword(tempPassword);
+  const { rows } = await pool.query(`
+    INSERT INTO users (name, email, password_hash, role, status,
+                       must_change_password, created_by)
+    VALUES ($1,$2,$3,$4,'ACTIVE', true, $5)
+    RETURNING id, name, email, role, status, must_change_password, created_at`,
+    [input.name, email, hash, input.role, req.session.user.id]);
+
+  await audit.run(req.session.user.id, 'CREATE', 'user', rows[0].id);
+
+  // Temp password returned exactly once — owner must deliver it out-of-band.
+  res.status(201).json({
+    user: rows[0],
+    tempPassword,
+    note: 'Share this password privately. The user must change it on first login.'
+  });
+}));
+
+app.patch('/api/users/:id', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const input = z.object({
+    name: z.string().min(2).max(120).optional(),
+    role: z.enum(ROLES).optional(),
+    status: z.enum(['ACTIVE', 'SUSPENDED']).optional()
+  }).parse(req.body);
+
+  if (id === req.session.user.id && input.status === 'SUSPENDED') {
+    return res.status(422).json({ error: 'You cannot suspend your own account.' });
+  }
+
+  const target = (await pool.query(
+    'SELECT id, role, status FROM users WHERE id = $1', [id])).rows[0];
+  if (!target) return res.status(404).json({ error: 'User not found.' });
+
+  // Guard: at least one ACTIVE OWNER must remain.
+  const willRemoveLastOwner =
+    target.role === 'OWNER' &&
+    ((input.role && input.role !== 'OWNER') || input.status === 'SUSPENDED');
+  if (willRemoveLastOwner) {
+    const { rows } = await pool.query(
+      `SELECT COUNT(*)::int AS n FROM users
+        WHERE role = 'OWNER' AND status = 'ACTIVE' AND id <> $1`, [id]);
+    if (rows[0].n === 0) {
+      return res.status(422).json({
+        error: 'There must always be at least one active OWNER.'
+      });
+    }
+  }
+
+  const fields = [];
+  const values = [];
+  let i = 1;
+  for (const [k, v] of Object.entries(input)) {
+    if (v !== undefined) { fields.push(`${k} = $${i++}`); values.push(v); }
+  }
+  if (fields.length === 0) return res.json({ ok: true, unchanged: true });
+
+  values.push(id);
+  const { rows } = await pool.query(
+    `UPDATE users SET ${fields.join(', ')}
+      WHERE id = $${i}
+      RETURNING id, name, email, role, status, must_change_password, created_at, last_login_at`,
+    values);
+
+  await audit.run(req.session.user.id, 'UPDATE', 'user', id);
+  res.json(rows[0]);
+}));
+
+app.post('/api/users/:id/reset-password', requireAuth, requirePasswordChanged,
+  requireRole('OWNER'), wrap(async (req, res) => {
+  const id = Number(req.params.id);
+  const target = (await pool.query(
+    'SELECT id, email FROM users WHERE id = $1', [id])).rows[0];
+  if (!target) return res.status(404).json({ error: 'User not found.' });
+
+  const tempPassword = generateTempPassword();
+  const hash = await hashPassword(tempPassword);
+  await pool.query(
+    `UPDATE users
+        SET password_hash = $1,
+            must_change_password = true
+      WHERE id = $2`,
+    [hash, id]);
+
+  await audit.run(req.session.user.id, 'RESET_PASSWORD', 'user', id);
+  res.json({
+    tempPassword,
+    note: 'Deliver this password privately. The user must change it on next login.'
+  });
+}));
+
+// ---- Error handler ----
+app.use((err, _req, res, _next) => {
+  if (err instanceof z.ZodError) {
+    return res.status(400).json({
+      error: 'Please check the submitted fields.',
+      details: err.issues.map((i) => ({ path: i.path.join('.'), message: i.message }))
+    });
+  }
+  if (err.code === '23505') {
+    return res.status(409).json({ error: 'That value already exists.' });
+  }
+  console.error(err);
+  res.status(err.status || 500).json({
+    error: err.status ? err.message : 'Unexpected server error.'
+  });
+});
+
+const server = app.listen(PORT, () =>
+  console.log(`MediFlow API listening on http://localhost:${PORT}`));
+
+// ---- Graceful shutdown ----
+for (const sig of ['SIGINT', 'SIGTERM']) {
+  process.on(sig, async () => {
+    console.log(`\n[shutdown] ${sig} received, closing…`);
+    server.close(async () => {
+      try { await pool.end(); } catch {}
+      process.exit(0);
+    });
+    // Failsafe
+    setTimeout(() => process.exit(1), 5000).unref();
+  });
+}

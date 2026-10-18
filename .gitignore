@@ -1,0 +1,22 @@
+
+backend/data/*.sqlite
+backend/.env
+backend/logs/
+backend/logs/*
+backend/uploads/*
+backend/uploads/.gitkeep
+backups/
+backups/*
+dist/
+.env
+.env.*
+!.env.example
+*.key
+*.log
+logs/
+# Logs and runtime files — never commit
+node_modules/
+*.pem
+*.pid
+# Secrets
+# Secrets and runtime data

@@ -1,0 +1,3 @@
+ALTER TABLE pharmacies
+  ADD COLUMN IF NOT EXISTS auto_sms_reminders BOOLEAN NOT NULL DEFAULT true,
+  ADD COLUMN IF NOT EXISTS sms_start_offset_minutes INTEGER NOT NULL DEFAULT 5;
