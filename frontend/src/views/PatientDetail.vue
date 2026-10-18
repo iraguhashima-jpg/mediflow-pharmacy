@@ -259,7 +259,7 @@ onMounted(async () => { await load(); await loadMessages(); });
             </div>
             <div class="span-2"><label>Address</label><input v-model="form.address"></div>
             <div class="span-2"><label>Allergies</label><input v-model="form.allergies"></div>
-            <div class="span-2"><label>Chronic conditions</label><input v-model="form.chronic_conditions"></div>
+            <div class="span-2"><label>Chronic conditions</label><input v-model="form.chronic_conditions" list="chronic-diseases" placeholder="Select or type"></div>
             <div><label>Insurance</label>
               <select v-model="form.insurance_id">
                 <option :value="null">— None —</option>
@@ -420,6 +420,31 @@ onMounted(async () => { await load(); await loadMessages(); });
         </div>
       </form>
     </div>
+
+  <!-- Chronic Diseases Datalist -->
+  <datalist id="chronic-diseases">
+    <option value="Hypertension"></option>
+    <option value="Coronary artery disease"></option>
+    <option value="Heart failure"></option>
+    <option value="Type 2 diabetes"></option>
+    <option value="Hypothyroidism"></option>
+    <option value="Chronic kidney disease"></option>
+    <option value="Asthma"></option>
+    <option value="Chronic obstructive pulmonary disease (COPD)"></option>
+    <option value="Alzheimer's disease"></option>
+    <option value="Parkinson's disease"></option>
+    <option value="Major depressive disorder"></option>
+    <option value="Osteoarthritis"></option>
+    <option value="Rheumatoid arthritis"></option>
+    <option value="Multiple sclerosis"></option>
+    <option value="Crohn's disease"></option>
+    <option value="Lupus"></option>
+    <option value="Fibromyalgia"></option>
+    <option value="Epilepsy"></option>
+    <option value="Chronic fatigue syndrome"></option>
+    <option value="Osteoporosis"></option>
+  </datalist>
+
 </AppLayout>
 </template>
 

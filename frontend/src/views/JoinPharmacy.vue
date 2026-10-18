@@ -27,14 +27,14 @@ async function sendOtp() {
   error.value = '';
   notice.value = '';
   if (!form.value.phone || form.value.phone.length < 8) {
-    error.value = 'Please enter a valid phone number (e.g., +25078...).';
+    error.value = 'Please enter a valid phone number first.';
     return;
   }
   otpBusy.value = true;
   try {
     await api.post('/auth/send-otp', { phone: form.value.phone });
     otpSent.value = true;
-    notice.value = 'Verification code sent! Check your phone (or the backend terminal).';
+    notice.value = 'Verification code sent! Check your SMS.';
   } catch (e) {
     error.value = e.response?.data?.error || 'Could not send SMS.';
   } finally { otpBusy.value = false; }
@@ -42,26 +42,10 @@ async function sendOtp() {
 
 async function submit() {
   error.value = '';
-  
-  // 1. Password length check
-  if (form.value.password.length < 10) {
-    error.value = 'Password must be at least 10 characters.'; return;
-  }
-  
-  // 2. Password cannot be email
-  if (form.value.password.toLowerCase() === form.value.email.toLowerCase()) {
-    error.value = 'Password cannot be the same as your email address.'; return;
-  }
-  
-  // 3. Password match
-  if (form.value.password !== form.value.confirm) { 
-    error.value = 'Passwords do not match.'; return; 
-  }
-
-  // 4. OTP check
-  if (!otpSent.value || !form.value.otp_code) { 
-    error.value = 'Please verify your phone number by entering the SMS code.'; return; 
-  }
+  if (form.value.password.length < 10) { error.value = 'Password must be at least 10 characters.'; return; }
+  if (form.value.password.toLowerCase() === form.value.email.toLowerCase()) { error.value = 'Password cannot be your email address.'; return; }
+  if (form.value.password !== form.value.confirm) { error.value = 'Passwords do not match.'; return; }
+  if (!otpSent.value || !form.value.otp_code) { error.value = 'Please verify your phone number first.'; return; }
   
   busy.value = true;
   try {
@@ -86,10 +70,7 @@ onMounted(load);
 <template>
   <section class="join-screen">
     <div class="join-card">
-      <router-link to="/" class="brand-link">
-        <span class="brand-mark small">✚</span>
-        <span class="brand-name">MediFlow</span>
-      </router-link>
+      <router-link to="/" class="brand-link"><span class="brand-mark small">✚</span><span class="brand-name">MediFlow</span></router-link>
 
       <div v-if="success" class="done">
         <div class="check">✓</div>
@@ -117,22 +98,15 @@ onMounted(load);
             </button>
           </div>
 
-          <!-- OTP BOX APPEARS HERE -->
           <div v-if="otpSent" style="margin-top:10px; background:#eafaf3; padding:12px; border-radius:8px; border:1px solid #cceee1;">
             <label style="color:#0a927b; margin-top:0;">Enter 6-digit SMS Code *</label>
             <input v-model="form.otp_code" required placeholder="123456" maxlength="6" style="border-color:#0a927b; font-weight:bold; letter-spacing:4px; font-size:16px;">
-            <p class="muted" style="margin-top:4px; font-size:10px;">Check the terminal running the backend to see the code.</p>
+            <p class="muted" style="margin-top:4px; font-size:10px;">Please enter the code sent to your phone.</p>
           </div>
 
           <div class="two-col" style="margin-top:15px;">
-            <div>
-              <label>Password * (min 10 chars)</label>
-              <input v-model="form.password" type="password" required minlength="10">
-            </div>
-            <div>
-              <label>Confirm Password *</label>
-              <input v-model="form.confirm" type="password" required minlength="10">
-            </div>
+            <div><label>Password * (min 10 chars)</label><input v-model="form.password" type="password" required minlength="10"></div>
+            <div><label>Confirm Password *</label><input v-model="form.confirm" type="password" required minlength="10"></div>
           </div>
 
           <label>Which pharmacy? *</label>
@@ -152,9 +126,7 @@ onMounted(load);
           <p v-if="error" class="error">{{ error }}</p>
           <p v-if="notice" class="ok-msg">{{ notice }}</p>
 
-          <button class="primary full" :disabled="busy || !otpSent">
-            {{ busy ? 'Sending…' : 'Send request' }}
-          </button>
+          <button class="primary full" :disabled="busy || !otpSent">{{ busy ? 'Sending…' : 'Send request' }}</button>
         </form>
       </template>
     </div>
